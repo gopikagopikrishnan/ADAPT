@@ -7,7 +7,7 @@ from torch.cuda.amp import autocast, GradScaler
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from monai.networks.layers import HilbertTransform
 import matplotlib.pyplot as plt
-from models.tribeamnet_model import FixedUNetBeamformer
+from model.tribeamnet_model import FixedUNetBeamformer
 
 class FixedTrainer:
     def __init__(self, dataset, batch_size=4, lr=1e-4, num_workers=2, use_amp=True):
