@@ -3,11 +3,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class BeamformingHead(nn.Module):
-    def __init__(self, in_channels: int, n_elements: int):
+    def __init__(self, in_channels, n_elements):
         super().__init__()
-        self.conv1 = nn.Conv2d(in_channels, n_elements * 2, kernel_size=3, padding=1, bias=False)
+        self.conv1 = nn.Conv2d(in_channels, n_elements * 2, 3, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(n_elements * 2)
-        self.conv2 = nn.Conv2d(n_elements * 2, n_elements, kernel_size=1)
+        self.conv2 = nn.Conv2d(n_elements * 2, n_elements, 1)
         self._initialize_weights()
 
     def _initialize_weights(self):
@@ -17,7 +17,7 @@ class BeamformingHead(nn.Module):
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x):
         x = F.relu(self.bn1(self.conv1(x)))
         weights = self.conv2(x)
         return F.softmax(weights, dim=1)
