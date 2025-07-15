@@ -1,0 +1,9 @@
+torch>=1.13.0
+torchvision
+torchaudio
+monai
+scipy
+numpy
+matplotlib
+h5py
+gdown
