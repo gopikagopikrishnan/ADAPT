@@ -1,3 +1,4 @@
+import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -9,25 +10,39 @@ from monai.networks.layers import HilbertTransform
 import matplotlib.pyplot as plt
 from model.tribeamnet_model import FixedUNetBeamformer
 
-class FixedTrainer:
-    def __init__(self, dataset, batch_size=4, lr=1e-4, num_workers=2, use_amp=True):
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+class Trainer():
+    def __init__(self, dataset, args, use_amp=True, split = 0.8):
+        
+        # Device setup
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.save_paths = args.save
+        
+        # Model Initilization        
         self.model = FixedUNetBeamformer().to(self.device)
         self.mse_loss = nn.MSELoss()
         self.l1_loss = nn.L1Loss()
-        self.optimizer = optim.AdamW(self.model.parameters(), lr=lr, weight_decay=1e-4)
+        self.optimizer = optim.AdamW(self.model.parameters(), lr=args.lr, weight_decay=1e-4)
         self.scheduler = ReduceLROnPlateau(self.optimizer, mode='min', patience=10, factor=0.5, verbose=True)
-        self.writer = SummaryWriter(log_dir='/content/runs/tribeamnet_logs')
         self.use_amp = use_amp
         self.scaler = GradScaler() if use_amp else None
-
-        train_size = int(len(dataset) * 0.8)
+        
+        # Set up directories and logging
+        os.makedirs(os.path.join(self.save_paths, "chkpt/", 'iter_' + str(args.run_no)), exist_ok=True)
+        os.makedirs(os.path.join(self.save_paths, "logs/"), exist_ok=True)
+        self.writer = SummaryWriter(os.path.join(self.save_paths, 'logs/iter_' + str(args.run_no)))
+        self.chkpt = os.path.join(self.save_paths, "chkpt", 'iter_' + str(args.run_no), "model.pt")
+        self.bestpt = os.path.join(self.save_paths, "chkpt", 'iter_' + str(args.run_no), "best.pt")
+       
+        # Train/Validation split
+        train_size = int(len(dataset) * split)
         valid_size = len(dataset) - train_size
         self.train_set, self.valid_set = random_split(dataset, [train_size, valid_size], generator=torch.Generator().manual_seed(42))
-
-        self.train_loader = DataLoader(self.train_set, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True)
-        self.valid_loader = DataLoader(self.valid_set, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
-
+        
+        # DataLoader with configurable number of workers
+        self.train_loader = DataLoader(self.train_set, batch_size=args.bs, shuffle=True, num_workers=args.num_workers, pin_memory=True)
+        self.valid_loader = DataLoader(self.valid_set, batch_size=args.bs, shuffle=False, num_workers=args.num_workers, pin_memory=True)
+        
     def compute_loss(self, outputs, targets):
         total_loss = 0
         for i, task in enumerate(['das', 'fdmas', 'capon']):
@@ -40,12 +55,29 @@ class FixedTrainer:
         return total_loss / 3
 
     def train_epoch(self):
+        
+        # Load checkpoint if exists
+        if os.path.exists(self.chkpt):
+            checkpoint = torch.load(self.chkpt)
+            self.model.load_state_dict(checkpoint['model_state_dict'])
+            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            self.scheduler.load_state_dict(checkpoint.get('scheduler_state_dict', self.scheduler.state_dict()))
+            self.epoch = checkpoint['epoch']
+            self.best_val_loss = checkpoint['loss']
+        else:
+            self.epoch = 0
+            self.best_val_loss = float('inf')
+            
+
+        
         self.model.train()
+        
         total_loss = 0
         for batch_idx, batch in enumerate(self.train_loader):
             input_data = batch['input'].to(self.device)
             gt_output = batch['output'].to(self.device)
             self.optimizer.zero_grad()
+            
             if self.use_amp:
                 with autocast():
                     outputs = self.model(input_data)
@@ -62,6 +94,7 @@ class FixedTrainer:
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                 self.optimizer.step()
             total_loss += loss.item()
+        
         return total_loss / len(self.train_loader)
 
     def validate_epoch(self):
@@ -82,26 +115,34 @@ class FixedTrainer:
         return total_loss / len(self.valid_loader)
 
     def train(self, epochs):
-        best_val_loss = float('inf')
+        
         for epoch in range(epochs):
             train_loss = self.train_epoch()
             val_loss = self.validate_epoch()
             self.scheduler.step(val_loss)
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                torch.save(self.model.state_dict(), '/content/best_model.pth')
+            
+            if val_loss < self.best_val_loss:
+                print("Saving best model weights...")
+                self.best_val_loss = val_loss
+                torch.save(self.model.state_dict(), self.bestpt)
+            
+            if epoch % 10 == 0 or val_loss < self.best_val_loss:
+                print("Saving model checkpoint...")
+                torch.save({
+                    'epoch': epoch,
+                    'model_state_dict': self.model.state_dict(),
+                    'optimizer_state_dict': self.optimizer.state_dict(),
+                    'scheduler_state_dict': self.scheduler.state_dict(),
+                    'loss': val_loss,
+                }, self.chkpt)
+                
             self.writer.add_scalar('Loss/train', train_loss, epoch)
             self.writer.add_scalar('Loss/val', val_loss, epoch)
             self.writer.add_scalar('LR', self.optimizer.param_groups[0]['lr'], epoch)
-            checkpoint_path = f'/content/checkpoint_epoch_{epoch}.pth'
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': self.model.state_dict(),
-                'optimizer_state_dict': self.optimizer.state_dict(),
-                'train_loss': train_loss,
-                'val_loss': val_loss,
-            }, checkpoint_path)
-            self.visualize_results(epoch + 1)
+            # self.visualize_results(epoch + 1)
+        
+        self.writer.flush()
+        self.writer.close()
 
     def visualize_results(self, epoch):
         self.model.eval()
