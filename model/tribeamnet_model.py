@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from model.blocks import DoubleConv, Down, Up
-from model.beamforming_heads import BeamformingHead
+from model.beamformer_heads import BeamformingHead
 
 class FixedUNetBeamformer(nn.Module):
     def __init__(self, n_elements=128, n_tasks=3):
