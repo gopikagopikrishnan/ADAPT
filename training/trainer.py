@@ -1,3 +1,4 @@
+import time
 import os
 import torch
 import torch.nn as nn
@@ -74,14 +75,21 @@ class Trainer():
         
         total_loss = 0
         for batch_idx, batch in enumerate(self.train_loader):
+            load_start = time.time()
             input_data = batch['input'].to(self.device)
             gt_output = batch['output'].to(self.device)
+            load_time = time.time() - load_start
+            print(f"Batch {batch_idx}: Data loading time = {load_time:.3f} s")
             self.optimizer.zero_grad()
             
             if self.use_amp:
                 with autocast():
+                    compute_start = time.time()
                     outputs = self.model(input_data)
                     loss = self.compute_loss(outputs, gt_output)
+                    compute_time = time.time() - compute_start
+                    print(f"Batch {batch_idx}: Forward pass + loss comp. time = {compute_time:.3f} s")
+
                 self.scaler.scale(loss).backward()
                 self.scaler.unscale_(self.optimizer)
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
@@ -115,12 +123,27 @@ class Trainer():
         return total_loss / len(self.valid_loader)
 
     def train(self, epochs):
-        
+        global_start = time.time()
         for epoch in range(epochs):
+            print(f"\nEpoch {epoch + 1}/{epochs}")
+            start_time = time.time()
+            val_start = time.time()
             train_loss = self.train_epoch()
             val_loss = self.validate_epoch()
+            val_time = time.time() - val_start
             self.scheduler.step(val_loss)
-            
+
+            end_time = time.time()
+            elapsed = end_time - start_time
+            print(f"Validation time = {val_time:.2f} s")
+            print(f"Epoch {epoch + 1} completed in {elapsed:.2f} s")
+
+            total_elapsed = time.time() - global_start
+            avg_epoch_time = total_elapsed / (epoch + 1)
+            epochs_left = epochs - epoch - 1
+            eta_seconds = avg_epoch_time * epochs_left
+            print(f"Estimated time remaining: {eta_seconds:.2f} s")
+                
             if val_loss < self.best_val_loss:
                 print("Saving best model weights...")
                 self.best_val_loss = val_loss
@@ -143,6 +166,8 @@ class Trainer():
         
         self.writer.flush()
         self.writer.close()
+        print(f"\nTotal training time: {time.time() - global_start:.2f} s")
+
 
     def visualize_results(self, epoch):
         self.model.eval()
