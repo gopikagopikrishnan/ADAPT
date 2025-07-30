@@ -1,4 +1,3 @@
-import time
 import os
 import torch
 import torch.nn as nn
@@ -10,13 +9,14 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 from monai.networks.layers import HilbertTransform
 import matplotlib.pyplot as plt
 from model.tribeamnet_model import FixedUNetBeamformer
-
+import time
 
 class Trainer():
     def __init__(self, dataset, args, use_amp=True, split = 0.8):
         
         # Device setup
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        print(f"The selected device is {self.device}")
         self.save_paths = args.save
         
         # Model Initilization        
@@ -57,39 +57,19 @@ class Trainer():
 
     def train_epoch(self):
         
-        # Load checkpoint if exists
-        if os.path.exists(self.chkpt):
-            checkpoint = torch.load(self.chkpt)
-            self.model.load_state_dict(checkpoint['model_state_dict'])
-            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            self.scheduler.load_state_dict(checkpoint.get('scheduler_state_dict', self.scheduler.state_dict()))
-            self.epoch = checkpoint['epoch']
-            self.best_val_loss = checkpoint['loss']
-        else:
-            self.epoch = 0
-            self.best_val_loss = float('inf')
-            
-
-        
         self.model.train()
         
         total_loss = 0
         for batch_idx, batch in enumerate(self.train_loader):
-            load_start = time.time()
+            #print(f"data loading time is {time.time()-init_time}")
             input_data = batch['input'].to(self.device)
             gt_output = batch['output'].to(self.device)
-            load_time = time.time() - load_start
-            print(f"Batch {batch_idx}: Data loading time = {load_time:.3f} s")
             self.optimizer.zero_grad()
             
             if self.use_amp:
                 with autocast():
-                    compute_start = time.time()
                     outputs = self.model(input_data)
                     loss = self.compute_loss(outputs, gt_output)
-                    compute_time = time.time() - compute_start
-                    print(f"Batch {batch_idx}: Forward pass + loss comp. time = {compute_time:.3f} s")
-
                 self.scaler.scale(loss).backward()
                 self.scaler.unscale_(self.optimizer)
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
@@ -122,52 +102,53 @@ class Trainer():
                 total_loss += loss.item()
         return total_loss / len(self.valid_loader)
 
-    def train(self, epochs):
-        global_start = time.time()
-        for epoch in range(epochs):
-            print(f"\nEpoch {epoch + 1}/{epochs}")
-            start_time = time.time()
-            val_start = time.time()
+    def train(self, epochs): 
+        
+        # Load checkpoint if exists
+        if os.path.exists(self.chkpt):
+            checkpoint = torch.load(self.chkpt)
+            self.model.load_state_dict(checkpoint['model_state_dict'])
+            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            self.scheduler.load_state_dict(checkpoint.get('scheduler_state_dict', self.scheduler.state_dict()))
+            self.start = checkpoint['epoch']
+            self.best_val_loss = checkpoint['loss']
+        else:
+            self.start = 0
+            self.best_val_loss = float('inf')
+            
+        for epoch in range(self.start,epochs):
+            print(f"Currently running the epoch {epoch}")
+            init_time = time.time()
             train_loss = self.train_epoch()
+            print(f"Time for running one epoch of training is {time.time()-init_time}")
+            #init_time = time.time()
             val_loss = self.validate_epoch()
-            val_time = time.time() - val_start
+            #print(f"Time for running one epoch of validation is {time.time()-init_time}")
             self.scheduler.step(val_loss)
-
-            end_time = time.time()
-            elapsed = end_time - start_time
-            print(f"Validation time = {val_time:.2f} s")
-            print(f"Epoch {epoch + 1} completed in {elapsed:.2f} s")
-
-            total_elapsed = time.time() - global_start
-            avg_epoch_time = total_elapsed / (epoch + 1)
-            epochs_left = epochs - epoch - 1
-            eta_seconds = avg_epoch_time * epochs_left
-            print(f"Estimated time remaining: {eta_seconds:.2f} s")
-                
+            
             if val_loss < self.best_val_loss:
                 print("Saving best model weights...")
                 self.best_val_loss = val_loss
                 torch.save(self.model.state_dict(), self.bestpt)
             
-            if epoch % 10 == 0 or val_loss < self.best_val_loss:
-                print("Saving model checkpoint...")
-                torch.save({
-                    'epoch': epoch,
-                    'model_state_dict': self.model.state_dict(),
-                    'optimizer_state_dict': self.optimizer.state_dict(),
-                    'scheduler_state_dict': self.scheduler.state_dict(),
-                    'loss': val_loss,
-                }, self.chkpt)
-                
+            print("Saving model checkpoint...")                
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': self.model.state_dict(),
+                'optimizer_state_dict': self.optimizer.state_dict(),
+                'scheduler_state_dict': self.scheduler.state_dict(),
+                'loss': val_loss,
+            }, self.chkpt)
+    
             self.writer.add_scalar('Loss/train', train_loss, epoch)
             self.writer.add_scalar('Loss/val', val_loss, epoch)
             self.writer.add_scalar('LR', self.optimizer.param_groups[0]['lr'], epoch)
-            # self.visualize_results(epoch + 1)
+            
+            if epoch%10 == 0:   
+                self.visualize_results(epoch + 1)
         
         self.writer.flush()
         self.writer.close()
-        print(f"\nTotal training time: {time.time() - global_start:.2f} s")
-
 
     def visualize_results(self, epoch):
         self.model.eval()
@@ -190,11 +171,11 @@ class Trainer():
             pred_env = torch.abs(hilbert(pred_img))
             pred_log = 20 * torch.log10(pred_env / torch.clamp(torch.max(pred_env), min=1e-8))
             pred_norm = (pred_log - torch.min(pred_log)) / (torch.max(pred_log) - torch.min(pred_log) + 1e-8)
-            axes[1, i].imshow(pred_norm.numpy().T, cmap='gray', aspect='auto')
+            axes[1, i].imshow(pred_norm.detach().numpy().T, cmap='gray', aspect='auto')
             axes[1, i].set_title(f'Pred - {task.upper()}')
             axes[1, i].axis('off')
         plt.tight_layout()
-        plt.savefig(f'/content/results_epoch_{epoch}.png', dpi=150, bbox_inches='tight')
+        plt.savefig(self.save_paths + os.sep + 'best_results.png', dpi=150, bbox_inches='tight')
         plt.close()
 
     def close_writer(self):
