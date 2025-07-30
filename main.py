@@ -1,7 +1,8 @@
-from dataset.patch_dataset import FixedCustomDatasetTriBeamNet
+from dataset.patch_dataset_simplified import FixedCustomDatasetTriBeamNet
 from training.trainer import Trainer
 import os
 import argparse
+
 
 def main():
     
@@ -27,7 +28,7 @@ def main():
     parser.add_argument("--bs", type=int,default=16)
     parser.add_argument("--lr", type=float,default=1e-4)
     parser.add_argument("--run_no", type=int,default=1)
-    parser.add_argument("--num_workers", type=int,default=1)
+    parser.add_argument("--num_workers", type=int,default=12)
     args = parser.parse_args()
     
     T = Trainer(dataset, args, use_amp=True, split = 0.8)
