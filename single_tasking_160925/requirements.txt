@@ -8,3 +8,4 @@ numpy
 matplotlib
 h5py
 ultraspy
+cupy-cuda12x
