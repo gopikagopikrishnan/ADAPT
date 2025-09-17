@@ -58,8 +58,8 @@ class Trainer:
                 bf = torch.sum(w * x, dim=1, keepdim=True)
                 env = torch.abs(HilbertTransform(axis=1)(bf.squeeze(1)))
                 log_env = 20 * torch.log10(env + 1e-8)
-                pred = torch.clamp(log_env, -60, 0)
-                pred = (pred + 60) / 60.0
+                pred = torch.clamp(log_env, -80, 0)
+                pred = (pred + 80) / 80.0
 
                 ssim = self.ssim_loss(pred.unsqueeze(1), y.unsqueeze(1))
                 l1 = self.l1_loss(pred, y)
