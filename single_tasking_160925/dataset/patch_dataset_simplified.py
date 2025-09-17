@@ -12,7 +12,7 @@ import cupy as cp
 
 class FixedCustomDatasetTriBeamNet(Dataset):
     def __init__(self, folder_path: str, patch_rows: int = 128,
-                 seed: int = 42, max_files: int = 100,
+                 seed: int = 42, max_files: int = 1000,
                  fs: int = 31250000, probe_geometry: np.ndarray = None,
                  save_stats_path: str = "global_stats.npz"):   # <--- NEW
         super().__init__()
