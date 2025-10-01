@@ -38,8 +38,8 @@ class FixedUNetBeamformer(nn.Module):
         x = self.up1(x4, x3)
         x = self.up2(x, x2)
         features = self.up3(x, x1)
-        #das = torch.sum(self.das_head(features) * original_input, dim=1, keepdim=True)
-        #fdmas = torch.sum(self.fdmas_head(features) * original_input, dim=1, keepdim=True)
-        capon = torch.sum(self.capon_head(features) * original_input, dim=1, keepdim=True)
+        #das = self.das_head(features)
+        #fdmas = self.fdmas_head(features)
+        capon = self.capon_head(features)
         # return {'das': das, 'fdmas': fdmas, 'capon': capon}
         return capon
