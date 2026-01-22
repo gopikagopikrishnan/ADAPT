@@ -105,7 +105,7 @@ Human wrist data acquired following the Helsinki Declaration of 1975 (revised 20
 
 ## Contact
 
-For more information, contact gopikagopikrishnan@gmail.com
+For more information, contact 
+Gopika Gopikrishnan -gopikagopikrishnan@gmail.com
 
-Gopika Gopikrishnan - [email]  
-Singapore Institute of Technology
+
