@@ -55,34 +55,12 @@ pip install -r requirements.txt
 
 ## Training
 ```python
-# Train individual beamformer networks
-python train.py --algorithm DAS --epochs 50 --lr 1e-3
-python train.py --algorithm FDMAS --epochs 50 --lr 1e-3
-python train.py --algorithm MV --epochs 50 --lr 1e-3
-
-# Training specifications:
+# Training specifications - individual beamformer networks:
 # - Loss: SSIM between Predcited and Ground Truth B-mode Images
 # - Optimizer: AdamW (with Kaiming He weight initialization)
 # - Scheduler: ReduceLROnPlateau (patience=5, factor=0.5)
 # - Mixed precision training enabled
 # - Train/validation split: 80/20
-```
-
-## Project Structure
-```
-ADAPT/
-├── models/
-│   ├── unet.py              # Modified U-Net architecture
-│   ├── adapt.py             # ADAPT framework
-│   └── task_head.py         # Apodization task head
-├── utils/
-│   ├── tofc.py              # CuPy-accelerated ToFC
-│   ├── losses.py            # SSIM loss
-│   └── metrics.py           # FWHM, CNR, gCNR
-├── train.py                 # Training script
-├── inference.py             # Inference with weight fusion
-├── data/
-│   └── dataset.py           # PyTorch dataset loader
 ```
 
 ## Citation
