@@ -1,126 +1,131 @@
-import torch
-from torch.utils.data import Dataset
+"""
+dataset.py
+
+Data-loading utilities for HDF5 ultrasound datasets and GPU-accelerated Time-of-Flight Correction (ToFC) via CuPy.
+
+HDF5 layout expected:
+/data               – raw RF data,  scale_factor attribute required
+/DAS                – DAS B-mode GT, scale_factor attribute required
+/FDMAS              – FDMAS B-mode GT, scale_factor attribute required
+/Capon              – Capon B-mode GT, scale_factor attribute required
+attrs['fs']         – sampling frequency (optional, falls back to config.FS)
+"""
+
+from __future__ import annotations
+
 import numpy as np
 import h5py
-import random
-from pathlib import Path
-from scipy.interpolate import interp1d
-from scipy.signal import decimate
+import cupy as cp
 
-class FixedCustomDatasetTriBeamNet(Dataset):
-    def __init__(self, folder_path: str, patch_rows: int = 128,
-                 seed: int = 42, max_files: int = 1000,
-                 fs: int = 31250000, probe_geometry: np.ndarray = None):
-        super().__init__()
-        self.folder_path = Path(folder_path)
-        self.file_paths = sorted([f for f in self.folder_path.glob("*.h5")])[:max_files]
-        self.rows = patch_rows
-        self.fs = fs
-        self.probe_geometry = probe_geometry if probe_geometry is not None else np.linspace(-0.019105, 0.019105, 128)
-        random.seed(seed)
 
-        if not self.file_paths:
-            raise ValueError(f"No HDF5 files found in {folder_path}")
+# ToFC - GPU based (CuPy)
 
-        print(f"Dataset initialized with {len(self.file_paths)} files")
-        self.global_mean = 0.0
-        self.global_std = 1.0
-        self.compute_global_stats()
+def tofc_mapping(rf_data: np.ndarray, fs: float, probe_geometry: np.ndarray, c: float, ) -> np.ndarray:
+    """Time-of-Flight Correction (ToFC) using CuPy (GPU).
 
-    def compute_global_stats(self):
-        all_values = []
-        sample_size = min(10, len(self.file_paths))
-        for path in self.file_paths[:sample_size]:
-            try:
-                with h5py.File(path, 'r') as f:
-                    raw_rf = f['raw_data'][:][0].T
-                    tofc = self.tofc_mapping(raw_rf)
-                    tofc = np.nan_to_num(tofc, nan=0.0, posinf=1.0, neginf=-1.0)
-                    all_values.append(tofc.flatten())
-            except Exception as e:
-                print(f"Error processing {path}: {e}")
+    Parameters
+    ----------
+    rf_data : (num_samples, num_channels) float array
+        Normalised RF channel data.
+    fs : float
+        Sampling frequency [Hz].
+    probe_geometry : (num_channels,) float array
+        Element lateral positions [m].
+    c : float
+        Speed of sound [m/s].
 
-        if all_values:
-            all_values = np.concatenate(all_values)
-            self.global_mean = np.median(all_values)
-            self.global_std = np.std(all_values)
-            if self.global_std == 0:
-                self.global_std = 1.0
-            print(f"Global stats - Mean: {self.global_mean:.4f}, Std: {self.global_std:.4f}")
+    Returns
+    -------
+    np.ndarray of shape (num_samples, num_channels, num_channels)
+        ToFC output on CPU.
+    """
+    rf_np = np.asarray(rf_data)
+    num_samples, num_channels = rf_np.shape
+    x_np = np.asarray(probe_geometry, dtype=np.float64).reshape(-1)
 
-    def __len__(self):
-        return len(self.file_paths)
+    rf = cp.asarray(rf_np, dtype=cp.float64, order="C")
+    x  = cp.asarray(x_np, dtype=cp.float64)
+    t  = cp.arange(num_samples, dtype=cp.float64) / float(fs)
+    z  = 0.5 * c * t
 
-    def __getitem__(self, idx):
-        path = self.file_paths[idx]
-        try:
-            with h5py.File(path, 'r') as f:
-                raw_rf = f['raw_data'][:][0].T
-                gt_bf_datas = []
-                for key in ['DAS', 'FDMAS', 'Capon']:
-                    try:
-                        bf_data = f[f'bf_data_{key}_real'][:].astype(np.float32)
-                        scale = f.attrs[f'scale_{key}_real']
-                        bf_data *= scale
-                        bf_data = np.nan_to_num(bf_data, nan=0.0, posinf=1.0, neginf=-1.0)
-                        if bf_data.shape[1] == 4352:
-                            bf_data = decimate(bf_data, q=2, axis=1)
-                        gt_bf_datas.append(bf_data)
-                    except Exception as e:
-                        print(f"Missing {key} in {path.name}, filling with zeros. Error: {e}")
-                        gt_bf_datas.append(np.zeros((128, 2176), dtype=np.float32))
+    xg, zg   = cp.meshgrid(x, z, indexing="xy")
+    x_flat   = xg.reshape(-1)
+    z_flat   = zg.reshape(-1)
 
-                tofc = self.tofc_mapping(raw_rf)
-                tofc = np.nan_to_num(tofc, nan=0.0, posinf=1.0, neginf=-1.0)
+    dx = x_flat[:, None] - x[None, :]
+    rx = cp.sqrt(dx * dx + z_flat[:, None] ** 2)
+    td = (z_flat[:, None] + rx) / c
 
-                valid_rows = tofc.shape[0]
-                max_start = max(0, valid_rows - self.rows)
-                start = np.random.randint(0, max_start + 1) if max_start > 0 else 0
-                end = start + self.rows
+    idx_right = cp.searchsorted(t, td, side="right")
+    idx_left  = cp.clip(idx_right - 1, 0, num_samples - 2)
+    idx_right = idx_left + 1
 
-                input_patch = tofc[start:end, :, :]
-                gt_patches = [gt[:, start:end].T for gt in gt_bf_datas]
+    t_left   = t[idx_left]
+    t_right  = t[idx_right]
+    w_interp = (td - t_left) / cp.maximum(t_right - t_left, 1e-6)
 
-                if input_patch.shape[0] != self.rows:
-                    pad = self.rows - input_patch.shape[0]
-                    input_patch = np.pad(input_patch, ((0, pad), (0, 0), (0, 0)), mode='constant')
-                    gt_patches = [np.pad(p, ((0, pad), (0, 0)), mode='constant') for p in gt_patches]
+    col_idx  = cp.arange(num_channels, dtype=cp.int64)[None, :]
+    rf_left  = rf[idx_left,  col_idx]
+    rf_right = rf[idx_right, col_idx]
+    y = (1.0 - w_interp) * rf_left + w_interp * rf_right
 
-                input_patch = self.normalize_input(input_patch)
-                gt_patches = [self.normalize_target(p) for p in gt_patches]
+    y[(td < t[0]) | (td > t[-1])] = 0.0
+    return cp.asnumpy(y.reshape(num_samples, num_channels, num_channels))
 
-                input_tensor = torch.from_numpy(input_patch.transpose(2, 0, 1)).float()
-                output_tensor = torch.from_numpy(np.stack(gt_patches, axis=0)).float()
 
-                return {'input': input_tensor, 'output': output_tensor}
+# ── Normalisation helpers ──────────────────────────────────────────────────────
 
-        except Exception as e:
-            print(f"Error loading file {path}: {e}")
-            return {'input': torch.randn(128, self.rows, 128), 'output': torch.randn(3, self.rows, 128)}
+def compute_global_stats(rf_data: np.ndarray) -> tuple[float, float]:
+    """Return (mean, std) of flattened RF data.  std is clipped to 1e-8."""
+    flat = rf_data.flatten()
+    mean = float(np.mean(flat))
+    std  = float(np.std(flat))
+    std  = max(std, 1e-8)
+    return mean, std
 
-    def normalize_input(self, data):
-        return (data - self.global_mean) / (self.global_std + 1e-8)
 
-    def normalize_target(self, data):
-        mean, std = np.mean(data), np.std(data)
-        if std == 0: std = 1.0
-        return (data - mean) / (std + 1e-8)
+def normalize_rf(rf_data: np.ndarray, mean: float, std: float) -> np.ndarray:
+    """z-score normalisation with a small epsilon guard."""
+    return (rf_data - mean) / (std + 1e-8)
 
-    def tofc_mapping(self, rf_data):
-        try:
-            c = 1540
-            time = np.arange(rf_data.shape[0]) / self.fs
-            x = np.linspace(self.probe_geometry[0], self.probe_geometry[-1], rf_data.shape[1])
-            z = 0.5 * c * time
-            xg, zg = np.meshgrid(x, z)
-            x_flat, z_flat = xg.ravel(), zg.ravel()
-            delay_map = np.zeros((rf_data.shape[0] * rf_data.shape[1], rf_data.shape[1]))
-            for i in range(rf_data.shape[1]):
-                rx_delay = np.sqrt((self.probe_geometry[i] - x_flat) ** 2 + z_flat ** 2)
-                total_delay = (z_flat + rx_delay) / c
-                interp = interp1d(time, rf_data[:, i], kind='cubic', fill_value=0, bounds_error=False)
-                delay_map[:, i] = interp(total_delay)
-            return delay_map.reshape(rf_data.shape[0], rf_data.shape[1], rf_data.shape[1])
-        except Exception as e:
-            print(f"TOFC mapping failed: {e}")
-            return np.zeros((rf_data.shape[0], rf_data.shape[1], rf_data.shape[1]))
+
+# h5 file loader
+
+def load_h5_sample(
+    file_path: str,
+    fallback_fs: float,
+) -> dict:
+    """Load a single HDF5 data file.
+
+    Returns a dict with keys:
+        idata      – (num_samples, num_channels) normalised RF
+        gt_das     – ground-truth DAS B-mode
+        gt_fdmas   – ground-truth FDMAS B-mode
+        gt_capon   – ground-truth Capon B-mode
+        fs         – actual sampling frequency
+    """
+    with h5py.File(file_path, "r") as f:
+        inp    = np.array(f["data"],  dtype="float32") / f["data"].attrs["scale_factor"]
+        idata  = np.transpose(inp, (1, 0))             # → (samples, channels)
+
+        gt_das   = np.array(f["DAS"],   dtype="float32") / f["DAS"].attrs["scale_factor"]
+        gt_fdmas = np.array(f["FDMAS"], dtype="float32") / f["FDMAS"].attrs["scale_factor"]
+        gt_capon = np.array(f["Capon"], dtype="float32") / f["Capon"].attrs["scale_factor"]
+
+        fs_attr = f.attrs.get("fs")
+        fs      = float(fs_attr) if fs_attr is not None else fallback_fs
+
+    return dict(idata=idata, gt_das=gt_das, gt_fdmas=gt_fdmas, gt_capon=gt_capon, fs=fs)
+
+
+def prepare_tofc_tensor(
+    idata: np.ndarray,
+    fs: float,
+    probe_geometry: np.ndarray,
+    c: float,
+) -> np.ndarray:
+    """Normalise RF data and apply ToFC.  Returns (C, H, W) float32 array."""
+    mean, std = compute_global_stats(idata)
+    norm_rf   = normalize_rf(idata, mean, std)
+    tofc      = tofc_mapping(norm_rf, fs=fs, probe_geometry=probe_geometry, c=c)
+    return np.nan_to_num(tofc.transpose(2, 0, 1)).astype(np.float32)
