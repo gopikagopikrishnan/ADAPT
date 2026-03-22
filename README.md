@@ -32,11 +32,12 @@ Instead of output ensembling, ADAPT performs fusion in the weight space. This si
 
 ---
 
-## 📂 Repository Structure
+## Repository Structure
 ```text
 ADAPT/
 ├── configs/          # Hyperparameters (fs, fc, c, patch size)
 ├── preprocess/       # RF to HDF5 conversion scripts
+├── tofc_functions/   # Different tofc functions that were used to improve computational speed
 ├── data/             # Dataset loaders (ToFC + patching)
 ├── model/            # FixedUNetBeamformer & AntiRectifier
 ├── train/            # Task-specific training loops
