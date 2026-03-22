@@ -1,183 +1,251 @@
-import os
+"""
+train/trainer.py
+Task-specific Trainer for a single FixedUNetBeamformer.
+
+Training signal
+───────────────
+  1. Apply softmax weights w to ToFC input x:
+       bf   = Σ_elements (w · x) = weighted beamforming
+  2. Envelope detection via Hilbert transform along depth axis.
+  3. Log-compression → normalise to [0, 1] using [-60, 0] dB range.
+  4. SSIM loss against GT b-mode (also in [0, 1]).
+
+Checkpoint layout:-
+  <save_dir>/
+    chkpt/iter_<run_no>/model.pt   — latest checkpoint (resume-safe)
+    chkpt/iter_<run_no>/best.pt    — best validation weights only
+    logs/iter_<run_no>/            — TensorBoard event files
+"""
+
+from __future__ import annotations
+
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+
+import gc
+from types import SimpleNamespace
+
 import torch
 import torch.nn as nn
-import torch.optim as optim
 from torch.utils.data import DataLoader, random_split
-from torch.utils.tensorboard import SummaryWriter
-from torch.cuda.amp import autocast, GradScaler
+from torch.optim import AdamW
 from torch.optim.lr_scheduler import ReduceLROnPlateau
-from monai.networks.layers import HilbertTransform
-import matplotlib.pyplot as plt
-from model.tribeamnet_model import FixedUNetBeamformer
-import time
+from torch.cuda.amp import autocast, GradScaler
+from torch.utils.tensorboard import SummaryWriter
 
-class Trainer():
-    def __init__(self, dataset, args, use_amp=True, split = 0.8):
-        
-        # Device setup
+import monai.losses
+from monai.networks.layers import HilbertTransform
+
+from model.adapt_model import FixedUNetBeamformer
+from configs.config import (
+    LR, WEIGHT_DECAY, SCHEDULER_PAT, SCHEDULER_FACTOR, GRAD_CLIP,
+    SPLIT, SEED, DB_MIN, DB_MAX,
+)
+
+
+class Trainer:
+    """Train one FixedUNetBeamformer for a single beamforming task.
+
+    Parameters
+    dataset :
+        ADAPTDataset initialised with the desired task.
+    args :
+        SimpleNamespace with fields:
+          save        - root directory for checkpoints and logs
+          bs          - batch size
+          num_workers - DataLoader workers
+          run_no      - run identifier (used in directory names)
+    use_amp :
+        Enable automatic mixed precision (recommended).
+    split :
+        Train / validation split ratio.
+    """
+
+    def __init__(
+        self,
+        dataset,
+        args:    SimpleNamespace,
+        use_amp: bool  = True,
+        split:   float = SPLIT,
+    ) -> None:
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        print(f"The selected device is {self.device}")
-        self.save_paths = args.save
-        
-        # Model Initilization        
-        self.model = FixedUNetBeamformer().to(self.device)
-        self.mse_loss = nn.MSELoss()
-        self.l1_loss = nn.L1Loss()
-        self.optimizer = optim.AdamW(self.model.parameters(), lr=args.lr, weight_decay=1e-4)
-        self.scheduler = ReduceLROnPlateau(self.optimizer, mode='min', patience=10, factor=0.5, verbose=True)
+        print(f"[Trainer] device={self.device}  task={dataset.task}")
+
+        self.task    = dataset.task
         self.use_amp = use_amp
+
+        # Model
+        self.model = FixedUNetBeamformer().to(self.device)
+
+        # Loss
+        self.ssim_loss = monai.losses.SSIMLoss(spatial_dims=2, data_range=1.0)
+
+        # Optimiser & scheduler
+        self.optimizer = AdamW(
+            self.model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY
+        )
+        self.scheduler = ReduceLROnPlateau(
+            self.optimizer, mode="min",
+            patience=SCHEDULER_PAT, factor=SCHEDULER_FACTOR,
+        )
         self.scaler = GradScaler() if use_amp else None
-        
-        # Set up directories and logging
-        os.makedirs(os.path.join(self.save_paths, "chkpt/", 'iter_' + str(args.run_no)), exist_ok=True)
-        os.makedirs(os.path.join(self.save_paths, "logs/"), exist_ok=True)
-        self.writer = SummaryWriter(os.path.join(self.save_paths, 'logs/iter_' + str(args.run_no)))
-        self.chkpt = os.path.join(self.save_paths, "chkpt", 'iter_' + str(args.run_no), "model.pt")
-        self.bestpt = os.path.join(self.save_paths, "chkpt", 'iter_' + str(args.run_no), "best.pt")
-       
-        # Train/Validation split
+
+        # Data split
         train_size = int(len(dataset) * split)
         valid_size = len(dataset) - train_size
-        self.train_set, self.valid_set = random_split(dataset, [train_size, valid_size], generator=torch.Generator().manual_seed(42))
-        
-        # DataLoader with configurable number of workers
-        self.train_loader = DataLoader(self.train_set, batch_size=args.bs, shuffle=True, num_workers=args.num_workers, pin_memory=True)
-        self.valid_loader = DataLoader(self.valid_set, batch_size=args.bs, shuffle=False, num_workers=args.num_workers, pin_memory=True)
-        
-    def compute_loss(self, outputs, targets):
-        total_loss = 0
-        for i, task in enumerate(['das', 'fdmas', 'capon']):
-            pred = outputs[task]
-            target = targets[:, i:i+1]
-            mse = self.mse_loss(pred, target)
-            l1 = self.l1_loss(pred, target)
-            task_loss = 0.8 * mse + 0.2 * l1
-            total_loss += task_loss
-        return total_loss / 3
+        self.train_set, self.valid_set = random_split(
+            dataset, [train_size, valid_size],
+            generator=torch.Generator().manual_seed(SEED),
+        )
+        kw = dict(batch_size=args.bs, num_workers=args.num_workers, pin_memory=True)
+        self.train_loader = DataLoader(self.train_set, shuffle=True,  **kw)
+        self.valid_loader = DataLoader(self.valid_set, shuffle=False, **kw)
 
-    def train_epoch(self):
-        
+        # Directories & logging
+        tag = f"{self.task}/iter_{args.run_no}"
+        chkpt_dir = os.path.join(args.save, "chkpt", tag)
+        os.makedirs(chkpt_dir, exist_ok=True)
+        os.makedirs(os.path.join(args.save, "logs"), exist_ok=True)
+
+        self.writer  = SummaryWriter(os.path.join(args.save, "logs", tag))
+        self.chkpt   = os.path.join(chkpt_dir, "model.pt")
+        self.bestpt  = os.path.join(chkpt_dir, "best.pt")
+
+    # Beamforming + normalisation
+
+    @staticmethod
+    def _bmode_prediction(
+        weights: torch.Tensor,   # (B, N_ELEM, H, W)
+        x:       torch.Tensor,   # (B, N_ELEM, H, W)
+    ) -> torch.Tensor:
+        """Apply apodization weights, Hilbert, log-compress → [0, 1].
+
+        Returns (B, H, W).
+        """
+        bf      = torch.sum(weights * x, dim=1)           # (B, H, W)
+        hilbert = HilbertTransform(axis=1)                 # Hilbert along depth
+        env     = torch.abs(hilbert(bf))                   # (B, H, W)
+        log_env = 20.0 * torch.log10(env + 1e-8)
+        pred    = torch.clamp(log_env, DB_MIN, DB_MAX)
+        pred    = (pred - DB_MIN) / (DB_MAX - DB_MIN)      # → [0, 1]
+        return pred
+
+    # Single epoch
+
+    def _forward(
+        self,
+        batch: dict,
+    ) -> torch.Tensor:
+        x = batch["input"].to(self.device)           # (B, 128, H, W)
+        y = batch["output"].to(self.device)          # (B, H, W)
+        w = self.model(x)                            # (B, 128, H, W)
+        pred = self._bmode_prediction(w, x)          # (B, H, W)
+        # SSIM expects (B, C, H, W)
+        loss = self.ssim_loss(pred.unsqueeze(1), y.unsqueeze(1))
+        return loss
+
+    def train_epoch(self) -> float:
         self.model.train()
-        
-        total_loss = 0
-        for batch_idx, batch in enumerate(self.train_loader):
-            #print(f"data loading time is {time.time()-init_time}")
-            input_data = batch['input'].to(self.device)
-            gt_output = batch['output'].to(self.device)
+        total = 0.0
+
+        for batch in self.train_loader:
             self.optimizer.zero_grad()
-            
+
             if self.use_amp:
                 with autocast():
-                    outputs = self.model(input_data)
-                    loss = self.compute_loss(outputs, gt_output)
+                    loss = self._forward(batch)
                 self.scaler.scale(loss).backward()
                 self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), GRAD_CLIP)
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
-                outputs = self.model(input_data)
-                loss = self.compute_loss(outputs, gt_output)
+                loss = self._forward(batch)
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), GRAD_CLIP)
                 self.optimizer.step()
-            total_loss += loss.item()
-        
-        return total_loss / len(self.train_loader)
 
-    def validate_epoch(self):
+            total += loss.item()
+
+        return total / len(self.train_loader)
+
+    def validate_epoch(self) -> float:
         self.model.eval()
-        total_loss = 0
+        total = 0.0
+
         with torch.no_grad():
             for batch in self.valid_loader:
-                input_data = batch['input'].to(self.device)
-                gt_output = batch['output'].to(self.device)
                 if self.use_amp:
                     with autocast():
-                        outputs = self.model(input_data)
-                        loss = self.compute_loss(outputs, gt_output)
+                        loss = self._forward(batch)
                 else:
-                    outputs = self.model(input_data)
-                    loss = self.compute_loss(outputs, gt_output)
-                total_loss += loss.item()
-        return total_loss / len(self.valid_loader)
+                    loss = self._forward(batch)
+                total += loss.item()
 
-    def train(self, epochs): 
-        
-        # Load checkpoint if exists
-        if os.path.exists(self.chkpt):
-            checkpoint = torch.load(self.chkpt)
-            self.model.load_state_dict(checkpoint['model_state_dict'])
-            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            self.scheduler.load_state_dict(checkpoint.get('scheduler_state_dict', self.scheduler.state_dict()))
-            self.start = checkpoint['epoch']
-            self.best_val_loss = checkpoint['loss']
+        return total / len(self.valid_loader)
+
+    # Full training loop
+
+    def train(self, epochs: int, resume: bool = True) -> None:
+        """Train for ``epochs`` epochs, optionally resuming from checkpoint.
+
+        Parameters
+        epochs : total number of epochs.
+        resume : if True and a checkpoint exists, continue from last epoch.
+        """
+        # ── Resume ────────────────────────────────────────────────────────────
+        if resume and os.path.exists(self.chkpt):
+            ckpt = torch.load(self.chkpt, map_location=self.device)
+            self.model.load_state_dict(ckpt["model_state_dict"])
+            self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+            self.scheduler.load_state_dict(
+                ckpt.get("scheduler_state_dict", self.scheduler.state_dict())
+            )
+            start          = ckpt["epoch"] + 1
+            best_val_loss  = ckpt["loss"]
+            print(f"[Trainer/{self.task}] Resumed from epoch {start - 1}.")
         else:
-            self.start = 0
-            self.best_val_loss = float('inf')
-            
-        for epoch in range(self.start,epochs):
-            print(f"Currently running the epoch {epoch}")
-            init_time = time.time()
+            start         = 0
+            best_val_loss = float("inf")
+
+        # Loop
+        for epoch in range(start, epochs):
             train_loss = self.train_epoch()
-            print(f"Time for running one epoch of training is {time.time()-init_time}")
-            #init_time = time.time()
-            val_loss = self.validate_epoch()
-            #print(f"Time for running one epoch of validation is {time.time()-init_time}")
+            val_loss   = self.validate_epoch()
             self.scheduler.step(val_loss)
-            
-            if val_loss < self.best_val_loss:
-                print("Saving best model weights...")
-                self.best_val_loss = val_loss
+
+            # Logging
+            self.writer.add_scalar("Loss/train", train_loss, epoch)
+            self.writer.add_scalar("Loss/val",   val_loss,   epoch)
+            self.writer.add_scalar(
+                "LR", self.optimizer.param_groups[0]["lr"], epoch
+            )
+            print(
+                f"[{self.task.upper():5s}] epoch {epoch:>4d}/{epochs}  "
+                f"train={train_loss:.5f}  val={val_loss:.5f}"
+            )
+
+            # Save best weights
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
                 torch.save(self.model.state_dict(), self.bestpt)
-            
-            print("Saving model checkpoint...")                
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': self.model.state_dict(),
-                'optimizer_state_dict': self.optimizer.state_dict(),
-                'scheduler_state_dict': self.scheduler.state_dict(),
-                'loss': val_loss,
-            }, self.chkpt)
-    
-            self.writer.add_scalar('Loss/train', train_loss, epoch)
-            self.writer.add_scalar('Loss/val', val_loss, epoch)
-            self.writer.add_scalar('LR', self.optimizer.param_groups[0]['lr'], epoch)
-            
-            if epoch%10 == 0:   
-                self.visualize_results(epoch + 1)
-        
+                print(f"  ↳ New best val loss ({val_loss:.5f}) — saved best.pt")
+
+            # Save resumable checkpoint
+            torch.save(
+                {
+                    "epoch":                epoch,
+                    "model_state_dict":     self.model.state_dict(),
+                    "optimizer_state_dict": self.optimizer.state_dict(),
+                    "scheduler_state_dict": self.scheduler.state_dict(),
+                    "loss":                 val_loss,
+                },
+                self.chkpt,
+            )
+
+            torch.cuda.empty_cache()
+            gc.collect()
+
         self.writer.flush()
         self.writer.close()
-
-    def visualize_results(self, epoch):
-        self.model.eval()
-        sample = next(iter(self.valid_loader))
-        input_data = sample['input'][:1].to(self.device)
-        gt_output = sample['output'][:1].to(self.device)
-        outputs = self.model(input_data)
-        fig, axes = plt.subplots(2, 3, figsize=(4, 12))
-        fig.suptitle(f'Epoch {epoch} - GT vs Pred')
-        hilbert = HilbertTransform(axis=1)
-        for i, task in enumerate(['das', 'fdmas', 'capon']):
-            gt_img = gt_output[0, i].cpu()
-            gt_env = torch.abs(hilbert(gt_img))
-            gt_log = 20 * torch.log10(gt_env / torch.clamp(torch.max(gt_env), min=1e-8))
-            gt_norm = (gt_log - torch.min(gt_log)) / (torch.max(gt_log) - torch.min(gt_log) + 1e-8)
-            axes[0, i].imshow(gt_norm.numpy().T, cmap='gray', aspect='auto')
-            axes[0, i].set_title(f'GT - {task.upper()}')
-            axes[0, i].axis('off')
-            pred_img = outputs[task][0, 0].cpu()
-            pred_env = torch.abs(hilbert(pred_img))
-            pred_log = 20 * torch.log10(pred_env / torch.clamp(torch.max(pred_env), min=1e-8))
-            pred_norm = (pred_log - torch.min(pred_log)) / (torch.max(pred_log) - torch.min(pred_log) + 1e-8)
-            axes[1, i].imshow(pred_norm.detach().numpy().T, cmap='gray', aspect='auto')
-            axes[1, i].set_title(f'Pred - {task.upper()}')
-            axes[1, i].axis('off')
-        plt.tight_layout()
-        plt.savefig(self.save_paths + os.sep + 'best_results.png', dpi=150, bbox_inches='tight')
-        plt.close()
-
-    def close_writer(self):
-        if hasattr(self, 'writer'):
-            self.writer.close()
+        print(f"[Trainer/{self.task}] Training complete.  Best val={best_val_loss:.5f}")
