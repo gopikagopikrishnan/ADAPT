@@ -43,7 +43,7 @@ pip install -r requirements.txt
 
 ## Dataset
 
-**Training**: 1000 wrist acquisitions from healthy volunteers
+**Training**: 1000 wrist acquisitions from healthy volunteers (https://zenodo.org/records/7813791)
 - Verasonics Vantage 128 with L11-5v probe
 - Center frequency: 7.6 MHz, Sampling frequency: 31.25 MHz
 - Single plane-wave transmission at 0°
