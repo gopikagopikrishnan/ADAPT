@@ -137,7 +137,7 @@ def _compute_tofc(
     return tofc.astype(np.float32)
 
 
-# ── Dataset ────────────────────────────────────────────────────────────────────
+# Dataset
 
 class ADAPTDataset(Dataset):
     """Patch-wise dataset for task-specific ADAPT training.
