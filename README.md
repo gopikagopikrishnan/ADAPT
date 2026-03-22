@@ -21,13 +21,13 @@ Official implementation of **"ADAPT: Multibeamformer with Tunable Weight Fusion 
 ### Training Pipeline
 The framework trains three identical U-Nets independently for DAS, FDMAS, and Capon tasks. The patch-wise strategy allows the model to learn local wavefront characteristics regardless of the absolute depth.
 
-![Training Strategy](isbi_training.png)
+![Training Strategy]([isbi_training.png](https://github.com/gopikagopikrishnan/ADAPT-Adaptive-Depth-Agnostic-Patch-wise-Tunable-multibeamformer/blob/main/isbi_26_training.png))
 *Figure 1: Overview of the ADAPT training workflow and patch-wise data augmentation.*
 
 ### Inference & Fusion
 Instead of output ensembling, ADAPT performs fusion in the weight space. This significantly reduces computational overhead during inference while allowing real-time tuning of image characteristics.
 
-![Inference and Weight Fusion](isbi_inference.png)
+![Inference and Weight Fusion]([isbi_inference.png](https://github.com/gopikagopikrishnan/ADAPT-Adaptive-Depth-Agnostic-Patch-wise-Tunable-multibeamformer/blob/main/isbi_26_inference.png))
 *Figure 2: The weight fusion mechanism enabling tunable diagnostic perspectives.*
 
 ---
