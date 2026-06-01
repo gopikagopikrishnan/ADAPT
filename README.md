@@ -3,11 +3,11 @@
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![Framework: PyTorch](https://img.shields.io/badge/PyTorch-%23EE4C2C.svg?style=flat&logo=PyTorch&logoColor=white)](https://pytorch.org/)
 [![GPU Acceleration: CUDA](https://img.shields.io/badge/CUDA-%2376B900.svg?style=flat&logo=nvidia&logoColor=white)](https://developer.nvidia.com/cuda-zone)
-[![Paper: ISBI 2026](https://img.shields.io/badge/Paper-ISBI%202026-B31B1B.svg)]([link_to_proceedings](https://doi.org/10.1109/ISBI61048.2026.11515322))
+[![Paper: ISBI 2026](https://img.shields.io/badge/Paper-ISBI%202026-B31B1B.svg)](https://doi.org/10.1109/ISBI61048.2026.11515322)
 
 **ADAPT** is a deep learning framework for adaptive ultrasound beamforming that achieves depth-independent learning through patch-wise processing. By utilizing **parameter-space fusion**, ADAPT enables the dynamic blending of DAS, FDMAS, and MV beamformers without retraining, providing clinicians with tunable, task-specific diagnostic perspectives in a single forward pass.
 
-[**📄 Read the Full Paper**](link yet to be released!)
+[**📄 Read the Full Paper**]https://doi.org/10.1109/ISBI61048.2026.11515322
 
 ---
 
